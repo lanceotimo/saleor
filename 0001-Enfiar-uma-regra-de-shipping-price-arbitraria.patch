@@ -1,0 +1,235 @@
+From 466a3b6be81feca1c7098837d4c64f7a74cfc592 Mon Sep 17 00:00:00 2001
+From: tonylampada <tonylampada@gmail.com>
+Date: Wed, 31 Jan 2018 16:05:10 -0200
+Subject: [PATCH] Enfiar uma regra de shipping price arbitraria
+
+---
+ .gitignore                                         |  1 +
+ correios/__init__.py                               |  7 ++++++
+ lojas/models.py                                    |  4 ++++
+ saleor/checkout/core.py                            | 11 +++++++---
+ saleor/checkout/forms.py                           | 25 +++++++++++++---------
+ saleor/checkout/views/__init__.py                  |  3 +--
+ .../0009_shippingmethod_calculator_class.py        | 20 +++++++++++++++++
+ saleor/shipping/models.py                          | 21 ++++++++++++++++--
+ templates/checkout/details.html                    |  2 +-
+ 9 files changed, 76 insertions(+), 18 deletions(-)
+ create mode 100644 correios/__init__.py
+ create mode 100644 saleor/shipping/migrations/0009_shippingmethod_calculator_class.py
+
+diff --git a/.gitignore b/.gitignore
+index 5d60ff0..bc4d4de 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -28,3 +28,4 @@ dist/
+ /static/
+ /saleor/static/assets/
+ webpack-bundle.json
++/local.env
+diff --git a/correios/__init__.py b/correios/__init__.py
+new file mode 100644
+index 0000000..298aa73
+--- /dev/null
++++ b/correios/__init__.py
+@@ -0,0 +1,7 @@
++from prices import Price
++from decimal import Decimal
++
++
++class ShippingCalc(object):
++    def shipping_price(self, checkout, shipping_mothod_country):
++        return Price(Decimal(-2), currency='USD')
+diff --git a/lojas/models.py b/lojas/models.py
+index 016a6a1..2893934 100644
+--- a/lojas/models.py
++++ b/lojas/models.py
+@@ -13,3 +13,7 @@ class Loja(TenantMixin):
+ 
+     # default true, schema will be automatically created and synced when it is saved
+     auto_create_schema = True
++
++# from datetime import date
++# l = Loja(name='loja3', paid_until=date(2020,12,31), on_trial=False)
++# l.save()
+diff --git a/saleor/checkout/core.py b/saleor/checkout/core.py
+index 0e51ca7..23e8c31 100644
+--- a/saleor/checkout/core.py
++++ b/saleor/checkout/core.py
+@@ -105,7 +105,7 @@ class Checkout:
+         """
+         for partition in self.cart.partition():
+             if self.shipping_method and partition.is_shipping_required():
+-                shipping_cost = self.shipping_method.get_total()
++                shipping_cost = self.shipping_method.get_total(checkout=self)
+             else:
+                 shipping_cost = Price(0, currency=settings.DEFAULT_CURRENCY)
+             total_with_shipping = partition.get_total(
+@@ -303,7 +303,7 @@ class Checkout:
+             self.billing_address, is_billing=True)
+ 
+         shipping_price = (
+-            self.shipping_method.get_total() if self.shipping_method
++            self.shipping_method.get_total(checkout=self) if self.shipping_method
+             else Price(0, currency=settings.DEFAULT_CURRENCY))
+         order_data = {
+             'language_code': get_language(),
+@@ -316,7 +316,6 @@ class Checkout:
+         if self.user.is_authenticated:
+             order_data['user'] = self.user
+             order_data['user_email'] = self.user.email
+-
+         else:
+             order_data['user_email'] = self.email
+ 
+@@ -382,6 +381,12 @@ class Checkout:
+         total = sum(cost_iterator, zero)
+         return total
+ 
++    def get_total_shipping(self):
++        if not self.shipping_method:
++            return None
++        else:
++            return self.shipping_method.get_total(checkout=self)
++
+     def get_total(self):
+         """Calculate order total with shipping."""
+         zero = Price(0, currency=settings.DEFAULT_CURRENCY)
+diff --git a/saleor/checkout/forms.py b/saleor/checkout/forms.py
+index 7cdbb7c..a2e6c67 100644
+--- a/saleor/checkout/forms.py
++++ b/saleor/checkout/forms.py
+@@ -66,26 +66,31 @@ class ShippingCountryChoiceField(forms.ModelChoiceField):
+ 
+     widget = forms.RadioSelect()
+ 
++    def __init__(self, checkout, *args, **kwargs):
++        self.checkout = checkout
++        super().__init__(*args, **kwargs)
++
+     def label_from_instance(self, obj):
+         """Return a friendly label for the shipping method."""
+-        price_html = format_price(obj.price.gross, obj.price.currency)
++        price = obj.get_total(self.checkout)
++        price_html = format_price(price.gross, price.currency)
+         label = mark_safe('%s %s' % (obj.shipping_method, price_html))
+         return label
+ 
+ 
+ class ShippingMethodForm(forms.Form):
+     """Shipping method form."""
+-
+-    method = ShippingCountryChoiceField(
+-        queryset=ShippingMethodCountry.objects.select_related(
+-            'shipping_method').order_by('price').all(),
+-        label=pgettext_lazy(
+-            'Shipping method form field label', 'Shipping method'),
+-        required=True)
+-
+-    def __init__(self, country_code, *args, **kwargs):
++    def __init__(self, checkout, *args, **kwargs):
+         super().__init__(*args, **kwargs)
++        self.fields['method'] = ShippingCountryChoiceField(
++            checkout,
++            queryset=ShippingMethodCountry.objects.select_related(
++                'shipping_method').order_by('price').all(),
++            label=pgettext_lazy(
++                'Shipping method form field label', 'Shipping method'),
++            required=True)
+         method_field = self.fields['method']
++        country_code = checkout.shipping_address.country.code
+         if country_code:
+             queryset = method_field.queryset
+             method_field.queryset = queryset.unique_for_country_code(
+diff --git a/saleor/checkout/views/__init__.py b/saleor/checkout/views/__init__.py
+index 68bb303..7a7813f 100644
+--- a/saleor/checkout/views/__init__.py
++++ b/saleor/checkout/views/__init__.py
+@@ -43,9 +43,8 @@ def shipping_address_view(request, checkout):
+ @add_voucher_form
+ def shipping_method_view(request, checkout):
+     """Display the shipping method selection step."""
+-    country_code = checkout.shipping_address.country.code
+     shipping_method_form = ShippingMethodForm(
+-        country_code, request.POST or None,
++        checkout, request.POST or None,
+         initial={'method': checkout.shipping_method})
+     if shipping_method_form.is_valid():
+         checkout.shipping_method = shipping_method_form.cleaned_data['method']
+diff --git a/saleor/shipping/migrations/0009_shippingmethod_calculator_class.py b/saleor/shipping/migrations/0009_shippingmethod_calculator_class.py
+new file mode 100644
+index 0000000..79abf3c
+--- /dev/null
++++ b/saleor/shipping/migrations/0009_shippingmethod_calculator_class.py
+@@ -0,0 +1,20 @@
++# -*- coding: utf-8 -*-
++# Generated by Django 1.11.9 on 2018-01-31 16:00
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('shipping', '0008_auto_20180108_0814'),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name='shippingmethod',
++            name='calculator_class',
++            field=models.CharField(blank=True, max_length=512, null=True),
++        ),
++    ]
+diff --git a/saleor/shipping/models.py b/saleor/shipping/models.py
+index 41cb653..e95dd62 100644
+--- a/saleor/shipping/models.py
++++ b/saleor/shipping/models.py
+@@ -18,6 +18,7 @@ class ShippingMethod(models.Model):
+ 
+     name = models.CharField(max_length=100)
+     description = models.TextField(blank=True, default='')
++    calculator_class = models.CharField(max_length=512, null=True, blank=True)
+ 
+     class Meta:
+         permissions = (
+@@ -90,5 +91,21 @@ class ShippingMethodCountry(models.Model):
+         return '%s %s' % (
+             self.shipping_method, self.get_country_code_display())
+ 
+-    def get_total(self):
+-        return self.price
++    def get_total(self, checkout=None):
++        if self.price.gross > 0 or not checkout:
++            return self.price
++        elif self.shipping_method.calculator_class:
++            calculator_class = self.shipping_method.calculator_class
++            calculator = _load_class(calculator_class)
++            return calculator.shipping_price(checkout, self)
++        else:
++            return self.price
++
++
++def _load_class(classname):
++    splitted = classname.split('.')
++    m, c = '.'.join(splitted[0:-1]), splitted[-1]
++    mod = __import__(m, fromlist=[c])
++    C = getattr(mod, c)
++    calculator = C()
++    return calculator
+diff --git a/templates/checkout/details.html b/templates/checkout/details.html
+index 8756cfb..b0a5638 100644
+--- a/templates/checkout/details.html
++++ b/templates/checkout/details.html
+@@ -51,7 +51,7 @@
+             </div>
+             <div class="col-4">
+               <p class="float-right">{% if checkout.shipping_method %}
+-                {% net checkout.shipping_method.get_total %}
++                {% net checkout.get_total_shipping %}
+               {% else %}
+                 &mdash;
+               {% endif %}</p>
+-- 
+2.7.4
+
